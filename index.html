@@ -1,0 +1,921 @@
+import { useState, useEffect, useCallback } from "react";
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, ReferenceLine
+} from "recharts";
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+const uid = () => Math.random().toString(36).slice(2, 9);
+const fmt = (n) =>
+  new Intl.NumberFormat("id-ID", { style: "currency", currency: "USD", minimumFractionDigits: 2 }).format(n);
+
+const EMPTY_FORM = {
+  date: new Date().toISOString().slice(0, 10),
+  symbol: "",
+  direction: "LONG",
+  entry: "",
+  exit: "",
+  stopLoss: "",
+  takeProfit: "",
+  size: "",
+  notes: "",
+};
+
+// detect exit type from prices
+function detectExitType(form) {
+  const e = parseFloat(form.entry);
+  const x = parseFloat(form.exit);
+  const sl = parseFloat(form.stopLoss);
+  const tp = parseFloat(form.takeProfit);
+  const isLong = form.direction === "LONG";
+  if (!e || !x) return "MANUAL";
+  if (sl && (isLong ? x <= sl : x >= sl)) return "SL";
+  if (tp && (isLong ? x >= tp : x <= tp)) return "TP";
+  return "MANUAL";
+}
+
+// ── auto-correction engine ────────────────────────────────────────────────────
+// When a trade hits SL, look back for the last TP trade on same symbol
+// and compute a recovery entry suggestion
+function computeCorrection(newTrade, allTrades) {
+  if (newTrade.exitType !== "SL") return null;
+  const sym = newTrade.symbol;
+  const slPrice = parseFloat(newTrade.stopLoss);
+  const entryPrice = parseFloat(newTrade.entry);
+  if (!slPrice || !entryPrice) return null;
+
+  // find last TP trade with same symbol (most recent first)
+  const prevTP = [...allTrades]
+    .filter(t => t.symbol === sym && t.exitType === "TP" && t.id !== newTrade.id)
+    .sort((a, b) => b.date.localeCompare(a.date))[0];
+
+  if (!prevTP) return null;
+
+  const prevTPPrice = parseFloat(prevTP.takeProfit) || parseFloat(prevTP.exit);
+  const prevEntryPrice = parseFloat(prevTP.entry);
+  if (!prevTPPrice || !prevEntryPrice) return null;
+
+  // re-entry = at the SL level (key price zone, treated as support/resistance)
+  const corrEntry = slPrice;
+  // TP reference = previous strategy's TP price
+  const corrTP = prevTPPrice;
+  // SL = tighter: half the original SL distance below re-entry
+  const origSLdist = Math.abs(entryPrice - slPrice);
+  const corrSL = newTrade.direction === "LONG"
+    ? corrEntry - origSLdist * 0.5
+    : corrEntry + origSLdist * 0.5;
+
+  // size to recover SL loss with this TP
+  const tpDist = Math.abs(corrTP - corrEntry);
+  const corrSize = tpDist > 0
+    ? parseFloat((Math.abs(newTrade.pnl) / tpDist).toFixed(4))
+    : parseFloat(newTrade.size);
+
+  const recoveryPnL = newTrade.direction === "LONG"
+    ? (corrTP - corrEntry) * corrSize
+    : (corrEntry - corrTP) * corrSize;
+
+  return {
+    triggerTradeId: newTrade.id,
+    prevTPTradeId: prevTP.id,
+    direction: newTrade.direction,
+    symbol: sym,
+    entry: corrEntry.toFixed(4),
+    exit: corrTP.toFixed(4),      // exit = previous TP as target
+    stopLoss: corrSL.toFixed(4),
+    takeProfit: corrTP.toFixed(4),
+    size: corrSize,
+    recoveryPnL,
+    reason: `Re-entry di level SL ${fmt(corrEntry)} menggunakan TP dari trade #${prevTP.id.slice(0,5)} (${fmt(corrTP)})`,
+    prevTPDate: prevTP.date,
+    prevTPPnL: prevTP.pnl,
+  };
+}
+
+// ── palette ───────────────────────────────────────────────────────────────────
+const C = {
+  bg: "#070B14",
+  surface: "#0E1422",
+  surfaceAlt: "#131929",
+  border: "#1C2A3A",
+  textPrimary: "#DCE8F5",
+  textSecondary: "#546E8A",
+  textMuted: "#2E4562",
+  green: "#0DD9A3",
+  greenDim: "#0A5F48",
+  red: "#FF3B5C",
+  redDim: "#5C1226",
+  gold: "#F5C842",
+  goldDim: "#4A3A08",
+  orange: "#FF8C42",
+  orangeDim: "#4A2808",
+  blue: "#3D9BE9",
+  blueDim: "#1A3A5C",
+  purple: "#9B6DFF",
+  purpleDim: "#2A1A5C",
+};
+
+// ── subcomponents ──────────────────────────────────────────────────────────────
+function StatCard({ label, value, sub, accent = C.textPrimary, icon }) {
+  return (
+    <div style={{
+      background: C.surface, border: `1px solid ${C.border}`,
+      borderRadius: 10, padding: "18px 22px",
+      display: "flex", flexDirection: "column", gap: 6, minWidth: 0,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 15 }}>{icon}</span>
+        <span style={{ color: C.textSecondary, fontSize: 11, fontFamily: "monospace", letterSpacing: 1, textTransform: "uppercase" }}>
+          {label}
+        </span>
+      </div>
+      <span style={{ color: accent, fontSize: 24, fontFamily: "monospace", fontWeight: 700, letterSpacing: -1 }}>
+        {value}
+      </span>
+      {sub && <span style={{ color: C.textMuted, fontSize: 11, fontFamily: "monospace" }}>{sub}</span>}
+    </div>
+  );
+}
+
+function Badge({ children, color, bg }) {
+  return (
+    <span style={{
+      background: bg, color, borderRadius: 4,
+      padding: "2px 8px", fontSize: 11,
+      fontFamily: "monospace", fontWeight: 700, letterSpacing: 1,
+    }}>
+      {children}
+    </span>
+  );
+}
+
+function ExitBadge({ exitType }) {
+  const map = {
+    TP: { label: "✅ TP", color: C.green, bg: C.greenDim },
+    SL: { label: "🛑 SL", color: C.red, bg: C.redDim },
+    MANUAL: { label: "✂️ MANUAL", color: C.gold, bg: C.goldDim },
+  };
+  const s = map[exitType] || map.MANUAL;
+  return <Badge color={s.color} bg={s.bg}>{s.label}</Badge>;
+}
+
+// ── correction banner ─────────────────────────────────────────────────────────
+function CorrectionBanner({ correction, onAccept, onDismiss }) {
+  return (
+    <div style={{
+      background: C.orangeDim,
+      border: `1px solid ${C.orange}`,
+      borderLeft: `4px solid ${C.orange}`,
+      borderRadius: 12, padding: "18px 20px",
+      display: "flex", flexDirection: "column", gap: 12,
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 20 }}>⚡</span>
+          <div>
+            <div style={{ color: C.orange, fontFamily: "monospace", fontWeight: 700, fontSize: 14 }}>
+              AUTO KOREKSI TERSEDIA
+            </div>
+            <div style={{ color: C.textSecondary, fontFamily: "monospace", fontSize: 11, marginTop: 2 }}>
+              Strategi pemulihan berbasis TP trade sebelumnya ({correction.symbol})
+            </div>
+          </div>
+        </div>
+        <button onClick={onDismiss} style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 18 }}>×</button>
+      </div>
+
+      <div style={{
+        display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))",
+        gap: 10, background: "rgba(0,0,0,0.3)", borderRadius: 8, padding: 14,
+      }}>
+        {[
+          { label: "DIRECTION", value: correction.direction, color: correction.direction === "LONG" ? C.green : C.red },
+          { label: "RE-ENTRY", value: parseFloat(correction.entry).toFixed(2), color: C.textPrimary },
+          { label: "TARGET TP", value: parseFloat(correction.takeProfit).toFixed(2), color: C.green },
+          { label: "KOREKSI SL", value: parseFloat(correction.stopLoss).toFixed(2), color: C.red },
+          { label: "SIZE", value: correction.size, color: C.blue },
+          { label: "EST. RECOVERY", value: fmt(correction.recoveryPnL), color: correction.recoveryPnL >= 0 ? C.green : C.red },
+        ].map(item => (
+          <div key={item.label} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <span style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 10, letterSpacing: 1 }}>{item.label}</span>
+            <span style={{ color: item.color, fontFamily: "monospace", fontWeight: 700, fontSize: 14 }}>{item.value}</span>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ color: C.textSecondary, fontFamily: "monospace", fontSize: 11, lineHeight: 1.5 }}>
+        📌 Referensi TP dari trade tanggal <strong style={{ color: C.gold }}>{correction.prevTPDate}</strong> yang profit {fmt(correction.prevTPPnL)}.
+        SL diperketat 50% dari jarak SL sebelumnya untuk manajemen risiko yang lebih baik.
+      </div>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <button onClick={onDismiss} style={{
+          flex: 1, padding: "10px 0", borderRadius: 8,
+          border: `1px solid ${C.border}`, background: "transparent",
+          color: C.textSecondary, cursor: "pointer", fontFamily: "monospace", fontSize: 12,
+        }}>Abaikan</button>
+        <button onClick={() => onAccept(correction)} style={{
+          flex: 2, padding: "10px 0", borderRadius: 8, border: "none",
+          background: C.orange, color: "#070B14", cursor: "pointer",
+          fontFamily: "monospace", fontWeight: 700, fontSize: 13,
+        }}>⚡ Pakai Koreksi Ini</button>
+      </div>
+    </div>
+  );
+}
+
+// ── modal form ────────────────────────────────────────────────────────────────
+function Modal({ onClose, onSubmit, initial = EMPTY_FORM, editMode, isCorrection }) {
+  const [form, setForm] = useState({ ...EMPTY_FORM, ...initial });
+  const set = (k, v) => setForm((p) => ({ ...p, [k]: v }));
+
+  const pnl = (() => {
+    const e = parseFloat(form.entry), x = parseFloat(form.exit), s = parseFloat(form.size);
+    if (!e || !x || !s) return null;
+    return form.direction === "LONG" ? (x - e) * s : (e - x) * s;
+  })();
+
+  const exitType = detectExitType(form);
+  const slDist = parseFloat(form.entry) && parseFloat(form.stopLoss)
+    ? Math.abs(parseFloat(form.entry) - parseFloat(form.stopLoss)) : null;
+  const tpDist = parseFloat(form.entry) && parseFloat(form.takeProfit)
+    ? Math.abs(parseFloat(form.takeProfit) - parseFloat(form.entry)) : null;
+  const rrRatio = slDist && tpDist && slDist > 0 ? (tpDist / slDist).toFixed(2) : null;
+
+  const inp = {
+    background: C.surfaceAlt, border: `1px solid ${C.border}`,
+    borderRadius: 7, color: C.textPrimary, padding: "10px 12px",
+    fontSize: 14, fontFamily: "monospace", outline: "none",
+    width: "100%", boxSizing: "border-box",
+  };
+  const lbl = {
+    color: C.textSecondary, fontSize: 11, fontFamily: "monospace",
+    letterSpacing: 1, marginBottom: 4, display: "block",
+  };
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)",
+      display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999,
+      backdropFilter: "blur(4px)",
+    }} onClick={onClose}>
+      <div style={{
+        background: C.surface,
+        border: `1px solid ${isCorrection ? C.orange : C.border}`,
+        borderTop: isCorrection ? `3px solid ${C.orange}` : `3px solid ${C.green}`,
+        borderRadius: 14, padding: 26, width: "min(500px, 95vw)",
+        boxShadow: "0 30px 80px rgba(0,0,0,0.9)",
+        maxHeight: "90vh", overflowY: "auto",
+      }} onClick={e => e.stopPropagation()}>
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+          <div>
+            <span style={{ color: isCorrection ? C.orange : C.textPrimary, fontWeight: 700, fontFamily: "monospace", fontSize: 15 }}>
+              {isCorrection ? "⚡ Log Koreksi Trade" : editMode ? "✎ Edit Trade" : "+ Log Trade"}
+            </span>
+            {isCorrection && (
+              <div style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 11, marginTop: 2 }}>
+                Parameter diisi otomatis dari koreksi — edit jika perlu
+              </div>
+            )}
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: C.textSecondary, cursor: "pointer", fontSize: 20 }}>×</button>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <div>
+            <label style={lbl}>DATE</label>
+            <input type="date" value={form.date} onChange={e => set("date", e.target.value)} style={inp} />
+          </div>
+          <div>
+            <label style={lbl}>SYMBOL</label>
+            <input placeholder="BTC/USDT" value={form.symbol} onChange={e => set("symbol", e.target.value.toUpperCase())} style={inp} />
+          </div>
+          <div>
+            <label style={lbl}>DIRECTION</label>
+            <select value={form.direction} onChange={e => set("direction", e.target.value)} style={{ ...inp, cursor: "pointer" }}>
+              <option>LONG</option><option>SHORT</option>
+            </select>
+          </div>
+          <div>
+            <label style={lbl}>SIZE (units)</label>
+            <input type="number" placeholder="0.00" value={form.size} onChange={e => set("size", e.target.value)} style={inp} />
+          </div>
+          <div>
+            <label style={lbl}>ENTRY PRICE</label>
+            <input type="number" placeholder="0.00" value={form.entry} onChange={e => set("entry", e.target.value)} style={inp} />
+          </div>
+          <div>
+            <label style={lbl}>EXIT PRICE</label>
+            <input type="number" placeholder="0.00" value={form.exit} onChange={e => set("exit", e.target.value)} style={inp} />
+          </div>
+          <div>
+            <label style={lbl}>🛑 STOP LOSS</label>
+            <input type="number" placeholder="0.00" value={form.stopLoss} onChange={e => set("stopLoss", e.target.value)}
+              style={{ ...inp, border: `1px solid ${C.redDim}` }} />
+          </div>
+          <div>
+            <label style={lbl}>🎯 TAKE PROFIT</label>
+            <input type="number" placeholder="0.00" value={form.takeProfit} onChange={e => set("takeProfit", e.target.value)}
+              style={{ ...inp, border: `1px solid ${C.greenDim}` }} />
+          </div>
+        </div>
+
+        <div style={{ marginTop: 12 }}>
+          <label style={lbl}>NOTES</label>
+          <textarea
+            placeholder="Setup, alasan entry, pelajaran..."
+            value={form.notes} onChange={e => set("notes", e.target.value)}
+            style={{ ...inp, resize: "vertical", minHeight: 60 }}
+          />
+        </div>
+
+        {/* live preview panel */}
+        {(pnl !== null || rrRatio) && (
+          <div style={{
+            marginTop: 14, padding: "14px 16px", borderRadius: 10,
+            background: C.surfaceAlt, border: `1px solid ${C.border}`,
+            display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12,
+          }}>
+            <div>
+              <div style={{ color: C.textMuted, fontSize: 10, fontFamily: "monospace", letterSpacing: 1 }}>EST. P&L</div>
+              <div style={{ color: pnl >= 0 ? C.green : C.red, fontFamily: "monospace", fontWeight: 700, fontSize: 16 }}>
+                {pnl !== null ? `${pnl >= 0 ? "+" : ""}${fmt(pnl)}` : "–"}
+              </div>
+            </div>
+            <div>
+              <div style={{ color: C.textMuted, fontSize: 10, fontFamily: "monospace", letterSpacing: 1 }}>R:R RATIO</div>
+              <div style={{ color: rrRatio >= 1 ? C.green : C.gold, fontFamily: "monospace", fontWeight: 700, fontSize: 16 }}>
+                {rrRatio ? `${rrRatio}x` : "–"}
+              </div>
+            </div>
+            <div>
+              <div style={{ color: C.textMuted, fontSize: 10, fontFamily: "monospace", letterSpacing: 1 }}>EXIT TYPE</div>
+              <div style={{ marginTop: 2 }}><ExitBadge exitType={exitType} /></div>
+            </div>
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+          <button onClick={onClose} style={{
+            flex: 1, padding: "11px 0", borderRadius: 8,
+            border: `1px solid ${C.border}`, background: "transparent",
+            color: C.textSecondary, cursor: "pointer", fontFamily: "monospace",
+          }}>Batal</button>
+          <button onClick={() => {
+            if (!form.symbol || !form.entry || !form.exit || !form.size) return;
+            onSubmit(form);
+          }} style={{
+            flex: 2, padding: "11px 0", borderRadius: 8, border: "none",
+            background: isCorrection ? C.orange : C.green,
+            color: "#070B14", cursor: "pointer",
+            fontFamily: "monospace", fontWeight: 700, fontSize: 14,
+          }}>
+            {isCorrection ? "⚡ Log Koreksi" : editMode ? "Simpan" : "Log Trade"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── chart tooltip ─────────────────────────────────────────────────────────────
+function CustomTooltip({ active, payload }) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0].payload;
+  return (
+    <div style={{ background: C.surfaceAlt, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 14px" }}>
+      <div style={{ color: C.textSecondary, fontSize: 11, fontFamily: "monospace" }}>{d.date} · {d.symbol}</div>
+      <div style={{ color: d.equity >= 0 ? C.green : C.red, fontFamily: "monospace", fontWeight: 700 }}>{fmt(d.equity)}</div>
+      {d.isCorrection && <div style={{ color: C.orange, fontSize: 10, fontFamily: "monospace" }}>⚡ Koreksi</div>}
+    </div>
+  );
+}
+
+// ── main app ──────────────────────────────────────────────────────────────────
+export default function TradingJourney() {
+  const [trades, setTrades] = useState([]);
+  const [showModal, setShowModal] = useState(false);
+  const [editTrade, setEditTrade] = useState(null);
+  const [correctionModal, setCorrectionModal] = useState(null); // pre-filled correction form
+  const [pendingCorrections, setPendingCorrections] = useState([]); // banners to show
+  const [dismissedIds, setDismissedIds] = useState(new Set());
+  const [filter, setFilter] = useState("");
+  const [tab, setTab] = useState("dashboard");
+  const [loading, setLoading] = useState(true);
+
+  // ── storage ───────────────────────────────────────────────────────────────
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get("trading_journal_v2");
+        if (r) {
+          const data = JSON.parse(r.value);
+          setTrades(data.trades || []);
+          setDismissedIds(new Set(data.dismissed || []));
+        }
+      } catch (_) {}
+      setLoading(false);
+    })();
+  }, []);
+
+  const save = useCallback(async (tradeList, dismissed) => {
+    try {
+      await window.storage.set("trading_journal_v2", JSON.stringify({
+        trades: tradeList,
+        dismissed: [...dismissed],
+      }));
+    } catch (_) {}
+  }, []);
+
+  // ── derive pending corrections from trade list ────────────────────────────
+  useEffect(() => {
+    const corrections = trades
+      .filter(t => t.exitType === "SL")
+      .map(t => {
+        const c = computeCorrection(t, trades);
+        return c ? { ...c, id: `corr_${t.id}` } : null;
+      })
+      .filter(Boolean)
+      .filter(c => !dismissedIds.has(c.id));
+    setPendingCorrections(corrections);
+  }, [trades, dismissedIds]);
+
+  // ── trade calculations ────────────────────────────────────────────────────
+  const calcPnl = (form) => {
+    const e = parseFloat(form.entry), x = parseFloat(form.exit), s = parseFloat(form.size);
+    if (!e || !x || !s) return 0;
+    return form.direction === "LONG" ? (x - e) * s : (e - x) * s;
+  };
+
+  const buildTrade = (form, extra = {}) => ({
+    ...form,
+    id: uid(),
+    pnl: calcPnl(form),
+    exitType: detectExitType(form),
+    ...extra,
+  });
+
+  const persist = (next, dismissed = dismissedIds) => {
+    const sorted = [...next].sort((a, b) => a.date.localeCompare(b.date));
+    setTrades(sorted);
+    save(sorted, dismissed);
+    return sorted;
+  };
+
+  const addTrade = (form) => {
+    const trade = buildTrade(form);
+    persist([...trades, trade]);
+    setShowModal(false);
+  };
+
+  const addCorrection = (form) => {
+    const trade = buildTrade(form, { isCorrection: true });
+    persist([...trades, trade]);
+    setCorrectionModal(null);
+  };
+
+  const updateTrade = (form) => {
+    const updated = { ...editTrade, ...form, pnl: calcPnl(form), exitType: detectExitType(form) };
+    persist(trades.map(t => t.id === editTrade.id ? updated : t));
+    setEditTrade(null);
+  };
+
+  const deleteTrade = (id) => {
+    if (!confirm("Hapus trade ini?")) return;
+    persist(trades.filter(t => t.id !== id));
+  };
+
+  const dismissCorrection = (corrId) => {
+    const next = new Set([...dismissedIds, corrId]);
+    setDismissedIds(next);
+    save(trades, next);
+  };
+
+  const acceptCorrection = (correction) => {
+    setCorrectionModal({
+      date: new Date().toISOString().slice(0, 10),
+      symbol: correction.symbol,
+      direction: correction.direction,
+      entry: correction.entry,
+      exit: correction.exit,
+      stopLoss: correction.stopLoss,
+      takeProfit: correction.takeProfit,
+      size: String(correction.size),
+      notes: `[AUTO KOREKSI] Referensi TP dari trade ${correction.prevTPDate}. Est. recovery: ${fmt(correction.recoveryPnL)}`,
+    });
+    dismissCorrection(correction.id);
+  };
+
+  // ── stats ─────────────────────────────────────────────────────────────────
+  const wins = trades.filter(t => t.pnl > 0);
+  const losses = trades.filter(t => t.pnl <= 0);
+  const totalPnl = trades.reduce((s, t) => s + t.pnl, 0);
+  const winRate = trades.length ? (wins.length / trades.length) * 100 : 0;
+  const bestTrade = trades.length ? Math.max(...trades.map(t => t.pnl)) : 0;
+  const worstTrade = trades.length ? Math.min(...trades.map(t => t.pnl)) : 0;
+  const avgWin = wins.length ? wins.reduce((s, t) => s + t.pnl, 0) / wins.length : 0;
+  const avgLoss = losses.length ? losses.reduce((s, t) => s + t.pnl, 0) / losses.length : 0;
+  const rr = avgLoss !== 0 ? Math.abs(avgWin / avgLoss) : 0;
+  const slHits = trades.filter(t => t.exitType === "SL").length;
+  const tpHits = trades.filter(t => t.exitType === "TP").length;
+  const corrections = trades.filter(t => t.isCorrection).length;
+
+  const equityCurve = trades.reduce((acc, t, i) => {
+    const prev = i === 0 ? 0 : acc[i - 1].equity;
+    acc.push({ date: t.date, symbol: t.symbol, equity: prev + t.pnl, isCorrection: t.isCorrection });
+    return acc;
+  }, []);
+
+  const filtered = trades
+    .filter(t => !filter || t.symbol.includes(filter.toUpperCase()) || t.direction.includes(filter.toUpperCase()) || (filter.toLowerCase() === "koreksi" && t.isCorrection))
+    .slice().reverse();
+
+  const navItems = [
+    { id: "dashboard", label: "Dashboard" },
+    { id: "log", label: `Log (${trades.length})` },
+    { id: "analytics", label: "Analytics" },
+    {
+      id: "koreksi",
+      label: `Koreksi${pendingCorrections.length > 0 ? ` (${pendingCorrections.length})` : ""}`,
+      alert: pendingCorrections.length > 0,
+    },
+  ];
+
+  if (loading) return (
+    <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <span style={{ color: C.green, fontFamily: "monospace" }}>Loading journal...</span>
+    </div>
+  );
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, color: C.textPrimary, fontFamily: "system-ui, sans-serif" }}>
+      {showModal && <Modal onClose={() => setShowModal(false)} onSubmit={addTrade} />}
+      {editTrade && <Modal onClose={() => setEditTrade(null)} onSubmit={updateTrade} initial={editTrade} editMode />}
+      {correctionModal && <Modal onClose={() => setCorrectionModal(null)} onSubmit={addCorrection} initial={correctionModal} isCorrection />}
+
+      {/* header */}
+      <div style={{
+        borderBottom: `1px solid ${C.border}`, padding: "15px 24px",
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+        background: C.surface, position: "sticky", top: 0, zIndex: 100,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ width: 32, height: 32, borderRadius: 8, background: C.green, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 17 }}>📈</div>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 15, fontFamily: "monospace" }}>Trading Journey</div>
+            <div style={{ color: C.textSecondary, fontSize: 11, fontFamily: "monospace" }}>
+              {trades.length} trade · {totalPnl >= 0 ? "+" : ""}{fmt(totalPnl)}
+              {pendingCorrections.length > 0 && (
+                <span style={{ color: C.orange, marginLeft: 10 }}>⚡ {pendingCorrections.length} koreksi menunggu</span>
+              )}
+            </div>
+          </div>
+        </div>
+        <button onClick={() => setShowModal(true)} style={{
+          background: C.green, color: "#070B14", border: "none",
+          borderRadius: 8, padding: "8px 16px", cursor: "pointer",
+          fontFamily: "monospace", fontWeight: 700, fontSize: 12, letterSpacing: 0.5,
+        }}>+ LOG TRADE</button>
+      </div>
+
+      {/* nav */}
+      <div style={{ display: "flex", padding: "0 24px", borderBottom: `1px solid ${C.border}`, background: C.surface }}>
+        {navItems.map(n => (
+          <button key={n.id} onClick={() => setTab(n.id)} style={{
+            background: "none", border: "none", cursor: "pointer",
+            padding: "11px 16px", fontFamily: "monospace", fontSize: 12,
+            color: tab === n.id ? (n.alert ? C.orange : C.green) : C.textSecondary,
+            borderBottom: tab === n.id ? `2px solid ${n.alert ? C.orange : C.green}` : "2px solid transparent",
+            position: "relative",
+          }}>
+            {n.label}
+            {n.alert && (
+              <span style={{
+                position: "absolute", top: 6, right: 4,
+                width: 7, height: 7, borderRadius: "50%",
+                background: C.orange, display: "inline-block",
+              }} />
+            )}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ padding: "22px 24px", maxWidth: 1100, margin: "0 auto" }}>
+
+        {/* pending correction banners (show on dashboard too) */}
+        {tab === "dashboard" && pendingCorrections.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 20 }}>
+            {pendingCorrections.map(c => (
+              <CorrectionBanner
+                key={c.id}
+                correction={c}
+                onAccept={acceptCorrection}
+                onDismiss={() => dismissCorrection(c.id)}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* ── DASHBOARD ── */}
+        {tab === "dashboard" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(170px, 1fr))", gap: 12 }}>
+              <StatCard label="Total P&L" value={fmt(totalPnl)} sub={`${trades.length} trades`} accent={totalPnl >= 0 ? C.green : C.red} icon="💰" />
+              <StatCard label="Win Rate" value={`${winRate.toFixed(1)}%`} sub={`${wins.length}W / ${losses.length}L`} accent={winRate >= 50 ? C.green : C.red} icon="🎯" />
+              <StatCard label="TP Hit" value={tpHits} sub={`${trades.length ? ((tpHits/trades.length)*100).toFixed(0) : 0}% dari total`} accent={C.green} icon="✅" />
+              <StatCard label="SL Hit" value={slHits} sub={`${corrections} koreksi dibuat`} accent={slHits > 0 ? C.red : C.textMuted} icon="🛑" />
+              <StatCard label="R:R Ratio" value={trades.length ? `${rr.toFixed(2)}x` : "–"} accent={rr >= 1 ? C.green : C.gold} icon="⚖️" />
+              <StatCard label="Best Trade" value={trades.length ? fmt(bestTrade) : "–"} accent={C.green} icon="🔺" />
+            </div>
+
+            {/* equity curve */}
+            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14 }}>
+                <span style={{ color: C.textSecondary, fontFamily: "monospace", fontSize: 11, letterSpacing: 1, textTransform: "uppercase" }}>Equity Curve</span>
+                <span style={{ color: totalPnl >= 0 ? C.green : C.red, fontFamily: "monospace", fontWeight: 700 }}>
+                  {totalPnl >= 0 ? "+" : ""}{fmt(totalPnl)}
+                </span>
+              </div>
+              {equityCurve.length === 0 ? (
+                <div style={{ height: 180, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <span style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 13 }}>Log trade pertama untuk melihat chart</span>
+                </div>
+              ) : (
+                <ResponsiveContainer width="100%" height={200}>
+                  <LineChart data={equityCurve}>
+                    <CartesianGrid stroke={C.border} strokeDasharray="3 3" />
+                    <XAxis dataKey="date" stroke={C.textMuted} tick={{ fontSize: 10, fontFamily: "monospace", fill: C.textSecondary }} />
+                    <YAxis stroke={C.textMuted} tick={{ fontSize: 10, fontFamily: "monospace", fill: C.textSecondary }} tickFormatter={v => `$${v}`} />
+                    <Tooltip content={<CustomTooltip />} />
+                    <ReferenceLine y={0} stroke={C.border} strokeDasharray="4 4" />
+                    <Line type="monotone" dataKey="equity" stroke={totalPnl >= 0 ? C.green : C.red} strokeWidth={2.5}
+                      dot={({ cx, cy, payload }) => (
+                        <circle key={cx} cx={cx} cy={cy} r={payload.isCorrection ? 6 : 4}
+                          fill={payload.isCorrection ? C.orange : (totalPnl >= 0 ? C.green : C.red)}
+                          stroke={payload.isCorrection ? C.orange : "none"}
+                          strokeWidth={payload.isCorrection ? 2 : 0}
+                        />
+                      )}
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+              {corrections > 0 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8 }}>
+                  <div style={{ width: 10, height: 10, borderRadius: "50%", background: C.orange }} />
+                  <span style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 10 }}>Titik oranye = trade koreksi</span>
+                </div>
+              )}
+            </div>
+
+            {/* recent trades */}
+            {trades.length > 0 && (
+              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20 }}>
+                <div style={{ color: C.textSecondary, fontFamily: "monospace", fontSize: 11, letterSpacing: 1, marginBottom: 12, textTransform: "uppercase" }}>5 Trade Terakhir</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {trades.slice(-5).reverse().map(t => (
+                    <div key={t.id} style={{
+                      display: "flex", justifyContent: "space-between", alignItems: "center",
+                      padding: "10px 14px", borderRadius: 8,
+                      background: t.isCorrection ? "rgba(255,140,66,0.08)" : C.surfaceAlt,
+                      border: `1px solid ${t.isCorrection ? C.orangeDim : C.border}`,
+                    }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                        {t.isCorrection && <Badge color={C.orange} bg={C.orangeDim}>⚡ KOREKSI</Badge>}
+                        <Badge color={t.direction === "LONG" ? C.green : C.red} bg={t.direction === "LONG" ? C.greenDim : C.redDim}>{t.direction}</Badge>
+                        <span style={{ fontFamily: "monospace", fontWeight: 700 }}>{t.symbol}</span>
+                        <ExitBadge exitType={t.exitType} />
+                        <span style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 11 }}>{t.date}</span>
+                      </div>
+                      <span style={{ color: t.pnl >= 0 ? C.green : C.red, fontFamily: "monospace", fontWeight: 700 }}>
+                        {t.pnl >= 0 ? "+" : ""}{fmt(t.pnl)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── LOG ── */}
+        {tab === "log" && (
+          <div>
+            <div style={{ display: "flex", gap: 10, marginBottom: 14, alignItems: "center" }}>
+              <input placeholder='Filter simbol, arah, atau ketik "koreksi"...'
+                value={filter} onChange={e => setFilter(e.target.value)}
+                style={{
+                  background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8,
+                  color: C.textPrimary, padding: "9px 14px", fontFamily: "monospace", fontSize: 13,
+                  flex: 1, outline: "none",
+                }}
+              />
+              <span style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 11 }}>{filtered.length} result</span>
+            </div>
+
+            {filtered.length === 0 ? (
+              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 50, display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
+                <div style={{ fontSize: 36 }}>📋</div>
+                <div style={{ color: C.textMuted, fontFamily: "monospace" }}>
+                  {trades.length === 0 ? "Belum ada trade." : "Tidak ada yang cocok."}
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {filtered.map((t) => (
+                  <div key={t.id} style={{
+                    background: t.isCorrection ? "rgba(255,140,66,0.06)" : C.surface,
+                    border: `1px solid ${t.isCorrection ? C.orange : t.pnl >= 0 ? C.greenDim : C.redDim}`,
+                    borderLeft: `3px solid ${t.isCorrection ? C.orange : t.pnl >= 0 ? C.green : C.red}`,
+                    borderRadius: 10, padding: "14px 16px",
+                  }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                        {t.isCorrection && <Badge color={C.orange} bg={C.orangeDim}>⚡ KOREKSI</Badge>}
+                        <Badge color={t.direction === "LONG" ? C.green : C.red} bg={t.direction === "LONG" ? C.greenDim : C.redDim}>{t.direction}</Badge>
+                        <span style={{ fontFamily: "monospace", fontWeight: 700, fontSize: 15 }}>{t.symbol}</span>
+                        <ExitBadge exitType={t.exitType || "MANUAL"} />
+                        <span style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 11 }}>{t.date}</span>
+                      </div>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
+                        <span style={{ color: t.pnl >= 0 ? C.green : C.red, fontFamily: "monospace", fontWeight: 700, fontSize: 16 }}>
+                          {t.pnl >= 0 ? "+" : ""}{fmt(t.pnl)}
+                        </span>
+                        <button onClick={() => setEditTrade(t)} style={{ background: C.blueDim, border: `1px solid ${C.blue}`, color: C.blue, borderRadius: 6, padding: "4px 9px", cursor: "pointer", fontFamily: "monospace", fontSize: 11 }}>✎</button>
+                        <button onClick={() => deleteTrade(t.id)} style={{ background: C.redDim, border: `1px solid ${C.red}`, color: C.red, borderRadius: 6, padding: "4px 9px", cursor: "pointer", fontFamily: "monospace", fontSize: 11 }}>✕</button>
+                      </div>
+                    </div>
+                    <div style={{ marginTop: 8, display: "flex", gap: 16, flexWrap: "wrap" }}>
+                      <span style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 11 }}>Entry {parseFloat(t.entry).toFixed(2)}</span>
+                      <span style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 11 }}>→ Exit {parseFloat(t.exit).toFixed(2)}</span>
+                      {t.stopLoss && <span style={{ color: C.redDim, fontFamily: "monospace", fontSize: 11 }}>🛑 SL {parseFloat(t.stopLoss).toFixed(2)}</span>}
+                      {t.takeProfit && <span style={{ color: C.greenDim, fontFamily: "monospace", fontSize: 11 }}>🎯 TP {parseFloat(t.takeProfit).toFixed(2)}</span>}
+                      <span style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 11 }}>× {t.size}</span>
+                    </div>
+                    {t.notes && <div style={{ color: C.textSecondary, fontSize: 12, marginTop: 6, fontStyle: "italic" }}>{t.notes}</div>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── ANALYTICS ── */}
+        {tab === "analytics" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            {trades.length === 0 ? (
+              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 50, display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
+                <div style={{ fontSize: 36 }}>📊</div>
+                <div style={{ color: C.textMuted, fontFamily: "monospace" }}>Log beberapa trade terlebih dahulu.</div>
+              </div>
+            ) : (
+              <>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(170px, 1fr))", gap: 12 }}>
+                  <StatCard label="Avg Win" value={fmt(avgWin)} accent={C.green} icon="✅" />
+                  <StatCard label="Avg Loss" value={fmt(avgLoss)} accent={C.red} icon="❌" />
+                  <StatCard label="R:R Ratio" value={`${rr.toFixed(2)}x`} accent={rr >= 1 ? C.green : C.gold} icon="⚖️" />
+                  <StatCard label="Profit Factor"
+                    value={losses.reduce((s, t) => s + Math.abs(t.pnl), 0)
+                      ? (wins.reduce((s, t) => s + t.pnl, 0) / Math.abs(losses.reduce((s, t) => s + t.pnl, 0))).toFixed(2) : "∞"}
+                    accent={C.blue} icon="📈" />
+                  <StatCard label="SL Hit" value={slHits} sub="stop loss kena" accent={C.red} icon="🛑" />
+                  <StatCard label="TP Hit" value={tpHits} sub="take profit kena" accent={C.green} icon="🎯" />
+                </div>
+
+                {/* P&L bar */}
+                <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20 }}>
+                  <div style={{ color: C.textSecondary, fontFamily: "monospace", fontSize: 11, letterSpacing: 1, marginBottom: 14, textTransform: "uppercase" }}>P&L Per Trade</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {trades.map((t, i) => {
+                      const max = Math.max(...trades.map(x => Math.abs(x.pnl)));
+                      const w = max ? (Math.abs(t.pnl) / max) * 100 : 0;
+                      return (
+                        <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                          <span style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 10, width: 20, textAlign: "right" }}>{i + 1}</span>
+                          <span style={{ color: C.textSecondary, fontFamily: "monospace", fontSize: 11, width: 75 }}>{t.symbol}</span>
+                          {t.isCorrection && <span style={{ fontSize: 10 }}>⚡</span>}
+                          <div style={{ flex: 1 }}>
+                            <div style={{ height: 16, borderRadius: 4, width: `${w}%`, minWidth: 3, background: t.isCorrection ? C.orange : t.pnl >= 0 ? C.green : C.red }} />
+                          </div>
+                          <span style={{ color: t.isCorrection ? C.orange : t.pnl >= 0 ? C.green : C.red, fontFamily: "monospace", fontSize: 12, width: 100, textAlign: "right" }}>
+                            {t.pnl >= 0 ? "+" : ""}{fmt(t.pnl)}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* symbol breakdown */}
+                {(() => {
+                  const bySymbol = {};
+                  trades.forEach(t => {
+                    if (!bySymbol[t.symbol]) bySymbol[t.symbol] = { pnl: 0, count: 0, wins: 0, slHits: 0, tpHits: 0 };
+                    bySymbol[t.symbol].pnl += t.pnl;
+                    bySymbol[t.symbol].count++;
+                    if (t.pnl > 0) bySymbol[t.symbol].wins++;
+                    if (t.exitType === "SL") bySymbol[t.symbol].slHits++;
+                    if (t.exitType === "TP") bySymbol[t.symbol].tpHits++;
+                  });
+                  return (
+                    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20 }}>
+                      <div style={{ color: C.textSecondary, fontFamily: "monospace", fontSize: 11, letterSpacing: 1, marginBottom: 14, textTransform: "uppercase" }}>By Symbol</div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        {Object.entries(bySymbol).sort((a, b) => b[1].pnl - a[1].pnl).map(([sym, d]) => (
+                          <div key={sym} style={{ padding: "12px 14px", borderRadius: 8, background: C.surfaceAlt, border: `1px solid ${C.border}` }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                              <span style={{ fontFamily: "monospace", fontWeight: 700 }}>{sym}</span>
+                              <span style={{ color: d.pnl >= 0 ? C.green : C.red, fontFamily: "monospace", fontWeight: 700 }}>
+                                {d.pnl >= 0 ? "+" : ""}{fmt(d.pnl)}
+                              </span>
+                            </div>
+                            <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+                              <Badge color={C.textSecondary} bg={C.bg}>{d.count} trades</Badge>
+                              <Badge color={C.green} bg={C.greenDim}>{d.wins}W</Badge>
+                              <Badge color={C.red} bg={C.redDim}>{d.count - d.wins}L</Badge>
+                              <Badge color={C.green} bg={C.greenDim}>🎯 TP×{d.tpHits}</Badge>
+                              <Badge color={C.red} bg={C.redDim}>🛑 SL×{d.slHits}</Badge>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ── KOREKSI TAB ── */}
+        {tab === "koreksi" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20 }}>
+              <div style={{ color: C.textSecondary, fontFamily: "monospace", fontSize: 11, letterSpacing: 1, marginBottom: 6, textTransform: "uppercase" }}>
+                Tentang Auto Koreksi
+              </div>
+              <div style={{ color: C.textSecondary, fontFamily: "monospace", fontSize: 12, lineHeight: 1.7 }}>
+                Sistem mendeteksi ketika trade kena <strong style={{ color: C.red }}>Stop Loss</strong>, lalu mencari trade sebelumnya
+                pada simbol yang sama yang kena <strong style={{ color: C.green }}>Take Profit</strong>.
+                Koreksi diusulkan dengan re-entry di level SL (zona support/resistance),
+                menggunakan <strong style={{ color: C.green }}>TP dari strategi sebelumnya</strong> sebagai target,
+                dan SL diperketat <strong style={{ color: C.gold }}>50%</strong> untuk manajemen risiko lebih baik.
+                Size otomatis dihitung untuk merecovery kerugian.
+              </div>
+            </div>
+
+            {pendingCorrections.length === 0 && (
+              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 50, display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
+                <div style={{ fontSize: 36 }}>✅</div>
+                <div style={{ color: C.textMuted, fontFamily: "monospace" }}>
+                  {slHits === 0 ? "Belum ada trade yang kena SL." : "Semua koreksi sudah ditangani."}
+                </div>
+              </div>
+            )}
+
+            {pendingCorrections.map(c => (
+              <CorrectionBanner key={c.id} correction={c} onAccept={acceptCorrection} onDismiss={() => dismissCorrection(c.id)} />
+            ))}
+
+            {corrections > 0 && (
+              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20 }}>
+                <div style={{ color: C.textSecondary, fontFamily: "monospace", fontSize: 11, letterSpacing: 1, marginBottom: 12, textTransform: "uppercase" }}>
+                  Riwayat Koreksi ({corrections})
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {trades.filter(t => t.isCorrection).reverse().map(t => (
+                    <div key={t.id} style={{
+                      padding: "12px 16px", borderRadius: 8,
+                      background: "rgba(255,140,66,0.06)", border: `1px solid ${C.orange}`,
+                      display: "flex", justifyContent: "space-between", alignItems: "center",
+                    }}>
+                      <div>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          <Badge color={C.orange} bg={C.orangeDim}>⚡ KOREKSI</Badge>
+                          <Badge color={t.direction === "LONG" ? C.green : C.red} bg={t.direction === "LONG" ? C.greenDim : C.redDim}>{t.direction}</Badge>
+                          <span style={{ fontFamily: "monospace", fontWeight: 700 }}>{t.symbol}</span>
+                          <span style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 11 }}>{t.date}</span>
+                        </div>
+                        {t.notes && <div style={{ color: C.textSecondary, fontSize: 11, marginTop: 4, fontStyle: "italic" }}>{t.notes}</div>}
+                      </div>
+                      <span style={{ color: t.pnl >= 0 ? C.green : C.red, fontFamily: "monospace", fontWeight: 700, fontSize: 16 }}>
+                        {t.pnl >= 0 ? "+" : ""}{fmt(t.pnl)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px 24px", textAlign: "center" }}>
+        <span style={{ color: C.textMuted, fontFamily: "monospace", fontSize: 11 }}>
+          Trading Journey · Auto Koreksi v2 · Data tersimpan otomatis
+        </span>
+      </div>
+    </div>
+  );
+}
